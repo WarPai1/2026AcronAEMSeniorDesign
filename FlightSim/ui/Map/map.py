@@ -119,18 +119,46 @@ class MapOverlay(QWidget):
         self.zoom = zoom_default
         self.lat = center_lat
         self.is_north_up = True
+        self.selected_heading = None
         
-        # --- FIXED UI SETTINGS ---
-        self.RING_RADIUS_PX = 200  # The circle will always be 200px on screen
+        self.RING_RADIUS_PX = 200
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
         cx, cy = self.width() / 2, self.height() / 2
+        self.RING_RADIUS_PX = min(200.0, max(20.0, (min(self.width(), self.height()) - 60) / 2))
         self.draw_fixed_range_circle(painter, cx, cy)
+        self.draw_heading_bug(painter, cx, cy)
         self.draw_aircraft(painter, cx, cy)
         self.draw_north_arrow(painter)
+
+    def draw_heading_bug(self, painter, cx, cy):
+        # ACRON: Use map bearing to place the heading bug and ticks in both map orientations.
+        radius = self.RING_RADIUS_PX
+        def point(deg, r):
+            angle = math.radians(deg - self.map_bearing)
+            return QPointF(cx + math.sin(angle) * r, cy - math.cos(angle) * r)
+        painter.save()
+        painter.setPen(QPen(QColor(255, 255, 255, 200), 1))
+        painter.setFont(QFont("Consolas", 9))
+        for heading in range(0, 360, 30):
+            painter.drawLine(point(heading, radius - 5), point(heading, radius))
+            pos = point(heading, radius + 14)
+            label = {0: "N", 90: "E", 180: "S", 270: "W"}.get(heading, str(heading))
+            painter.drawText(QRect(int(pos.x()-14), int(pos.y()-9), 28, 18),
+                             Qt.AlignmentFlag.AlignCenter, label)
+        if self.selected_heading is not None and math.isfinite(self.selected_heading):
+            selected = self.selected_heading
+            painter.setPen(QPen(QColor(255, 0, 255), 2))
+            painter.setBrush(QColor(255, 0, 255))
+            painter.drawPolygon(QPolygonF([
+                point(selected, radius - 16),
+                point(selected - 3, radius + 2),
+                point(selected + 3, radius + 2)
+            ]))
+        painter.restore()
 
     def draw_fixed_range_circle(self, painter, cx, cy):
         """Draws a circle that stays the same size on screen, but updates the NM label."""
@@ -343,6 +371,12 @@ class Map(QWidget):
         js_code = f"if(window.updateMap) {{ window.updateMap({lat}, {lon}, {map_hdg}, {self.current_zoom}); }}"
         self.view.page().runJavaScript(js_code)
         self.overlay.update()
+
+    def set_selected_heading(self, heading):
+        heading = float(heading)
+        if math.isfinite(heading):
+            self.overlay.selected_heading = heading % 360.0
+            self.overlay.update()
 
 if __name__ == "__main__": # starts the window or something I dont understand
     server = start_server()

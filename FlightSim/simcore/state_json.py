@@ -134,6 +134,10 @@ class state_json:
             "alt_ft": self.alt_ft,
             "tas_kt": self.tas_kt,
             "vrate_fps": self.v_down_fps,
+            # ACRON: Expose forward, right, and down velocity (ft/s) to the FPV.
+            "u_fps": self.u_fps,
+            "v_fps": self.v_fps,
+            "w_fps": self.w_fps,
 
             # Propulsion
             "rotor_powers_kw": self.rotor_powers_kw,

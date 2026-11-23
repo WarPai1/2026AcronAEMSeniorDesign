@@ -4,11 +4,11 @@ from collections import deque
 from turtle import heading
 
 # PyQt6 core + GUI classes
-from PyQt6.QtCore import Qt, QPointF, QRectF, QPoint, QLine, QLineF
+from PyQt6.QtCore import Qt, QPointF, QRectF, QPoint, QLine, QLineF, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QPolygonF, QShortcut, QKeySequence, QBrush
 import math
 import time
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QCheckBox
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QCheckBox
 
 
 # All the widgets used are built here (except the map and synthetic vision)
@@ -62,13 +62,38 @@ class AttitudeOverlay(QWidget):
         super().__init__(parent)
         self.roll = 0.0
         self.pitch = 0.0
+        self.u_fps = 0.0
+        self.v_fps = 0.0
+        self.w_fps = 0.0
+        self.fd_enabled = False
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.altitude_ft = 0.0
+        self.selected_altitude_ft = 1000.0
+        self.heading_deg = 0.0
+        self.selected_heading_deg = 90.0
 
     def set_state(self, roll, pitch):
         self.roll, self.pitch = roll, pitch
         self.update()
+    
+    def set_velocity(self, u, v, w):
+        self.u_fps = float(u)
+        self.v_fps = float(v)
+        self.w_fps = float(w)
+        self.update()
 
+    def set_altitude(self, altitude_ft):
+        self.altitude_ft = float(altitude_ft)
+        self.update()
+
+    def set_heading(self, heading_deg):
+        self.heading_deg = float(heading_deg) % 360.0
+        self.update()
+    def set_selected_targets(self, heading_deg, altitude_ft):
+        self.selected_heading_deg = float(heading_deg) % 360.0
+        self.selected_altitude_ft = float(altitude_ft)
+        self.update()
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -153,6 +178,137 @@ class AttitudeOverlay(QWidget):
             QPoint(int(cx + 60), int(cy + 30))
         ]
         p.drawPolygon(QPolygonF([QPointF(pt) for pt in points]))
+        # ACRON: Project body velocity onto the pitch ladder to position the FPV.
+        u = self.u_fps
+        v = self.v_fps
+        down = self.w_fps
+
+        # The F/D remains available when there is no usable forward FPV.
+        velocity_valid = all(math.isfinite(value) for value in (u, v, down))
+        if not velocity_valid or u < 1.0:
+            fd_drawn = self._draw_flight_director(p, cx, cy)
+            status = (
+                "FPV: LOW FORWARD SPEED" if velocity_valid
+                else "FPV: INVALID VELOCITY"
+            )
+            if fd_drawn:
+                status += "\nF/D REF: AIRCRAFT"
+            p.setPen(QPen(Qt.GlobalColor.white, 1))
+            p.setFont(QFont("Consolas", 10))
+            p.drawText(
+                QRectF(cx - 190, cy + 95, 380, 48),
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                status
+            )
+            return
+
+        # Direction of motion relative to the aircraft
+        horizontal_angle = math.degrees(math.atan2(v, u))
+        vertical_angle = math.degrees(
+            math.atan2(-down, math.hypot(u, v))
+        )
+
+        # Match the existing pitch ladder's angular scale
+        pixels_per_degree = h / 80.0
+
+        raw_x = cx + horizontal_angle * pixels_per_degree
+        raw_y = cy - vertical_angle * pixels_per_degree
+
+        # Keep the marker away from the tapes and lower compass
+        fpv_x = max(w * 0.22, min(w * 0.78, raw_x))
+        fpv_y = max(h * 0.08, min(h * 0.66, raw_y))
+
+        # Clearly identify a direction beyond the display limits
+        if fpv_x != raw_x or fpv_y != raw_y:
+            p.setPen(QPen(Qt.GlobalColor.white, 1))
+            p.setFont(QFont("Consolas", 9))
+            p.drawText(
+                QRectF(fpv_x - 90, fpv_y + 25, 180, 20),
+                Qt.AlignmentFlag.AlignCenter,
+                "FPV OFF SCALE"
+            )
+
+        p.setPen(QPen(Qt.GlobalColor.white, 2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+        # Center circle
+        p.drawEllipse(QPointF(fpv_x, fpv_y), 10, 10)
+
+        # Left wing
+        p.drawLine(
+            QPointF(fpv_x - 28, fpv_y),
+            QPointF(fpv_x - 10, fpv_y)
+        )
+
+        # Right wing
+        p.drawLine(
+            QPointF(fpv_x + 10, fpv_y),
+            QPointF(fpv_x + 28, fpv_y)
+        )
+
+        # Top stem
+        p.drawLine(
+            QPointF(fpv_x, fpv_y - 10),
+            QPointF(fpv_x, fpv_y - 22)
+        )
+        self._draw_flight_director(p, fpv_x, fpv_y)
+
+    def _draw_flight_director(self, p, reference_x, reference_y):
+        """Draw against the FPV, or the aircraft reference if FPV is unavailable."""
+        if not self.fd_enabled:
+            return False
+        if not all(math.isfinite(value) for value in (
+            self.altitude_ft, self.selected_altitude_ft,
+            self.heading_deg, self.selected_heading_deg
+        )):
+            return False
+
+        w, h = self.width(), self.height()
+        # ACRON: Use altitude error for the vertical cue and heading error for the lateral cue.
+        altitude_error = (
+            self.selected_altitude_ft - self.altitude_ft
+        )
+
+        # Starting display sensitivity: 100 ft = 10 pixels
+        vertical_offset = altitude_error * 0.1
+
+        # Limit separation from the FPV
+        vertical_offset = max(-60.0, min(60.0, vertical_offset))
+
+        # Shortest turn to the selected heading
+        heading_error = (
+            self.selected_heading_deg - self.heading_deg + 180.0
+        ) % 360.0 - 180.0
+
+        # Starting sensitivity: 1 degree = 2 pixels
+        horizontal_offset = heading_error * 2.0
+        horizontal_offset = max(
+            -60.0, min(60.0, horizontal_offset)
+        )
+
+        fd_x = reference_x + horizontal_offset
+        fd_x = max(24.0, min(w - 24.0, fd_x))
+        fd_y = reference_y - vertical_offset
+
+        # Keep the brackets inside the widget
+        fd_y = max(24.0, min(h - 24.0, fd_y))
+
+        p.setPen(QPen(QColor(255, 0, 255), 3))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+        for sx, sy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
+            corner_x = fd_x + sx * 18
+            corner_y = fd_y + sy * 18
+
+            p.drawLine(
+                QPointF(corner_x, corner_y),
+                QPointF(corner_x - sx * 9, corner_y)
+            )
+            p.drawLine(
+                QPointF(corner_x, corner_y),
+                QPointF(corner_x, corner_y - sy * 9)
+            )
+        return True
 
 class AttitudeIndicator(QWidget):
     def __init__(self, parent=None):
@@ -168,113 +324,188 @@ class AttitudeIndicator(QWidget):
         self.bg.set_state(roll, pitch)
         self.overlay.set_state(roll, pitch)
 
+    def set_velocity(self, u, v, w):
+        self.overlay.set_velocity(u, v, w)
+
+class ModeControlPanel(QWidget):
+    """On-screen controls using the same target changes as the physical MCP."""
+    # ACRON: Panel buttons send target steps, sync requests, and the F/D toggle.
+    target_step_requested = pyqtSignal(str, int)
+    sync_requested = pyqtSignal(str)
+    fd_toggle_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            "QPushButton {background:#16191e; color:white; border:1px solid #666;"
+            "border-radius:3px; padding:4px; min-width:24px;}"
+            "QPushButton:checked {background:#401040; border-color:magenta;}"
+            "QPushButton:disabled {color:#666;}"
+        )
+        row = QHBoxLayout(self)
+        row.setContentsMargins(4, 2, 4, 2)
+        row.setSpacing(12)
+        self.value_labels = {}
+        self.sync_buttons = {}
+        self.step_buttons = {}
+        for key, title in [("speed_kt", "SPD / KT"),
+                           ("heading_deg", "HDG / DEG"),
+                           ("altitude_ft", "ALT / FT")]:
+            group = QVBoxLayout()
+            group.setSpacing(2)
+            label = QLabel(title)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            group.addWidget(label)
+            value = QLabel()
+            value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            value.setStyleSheet("color:magenta; font: bold 16px 'Consolas';")
+            self.value_labels[key] = value
+            group.addWidget(value)
+            buttons = QHBoxLayout()
+            minus, sync, plus = QPushButton("-"), QPushButton("Sync"), QPushButton("+")
+            minus.clicked.connect(
+                lambda checked=False, k=key: self.target_step_requested.emit(k, -1)
+            )
+            plus.clicked.connect(
+                lambda checked=False, k=key: self.target_step_requested.emit(k, 1)
+            )
+            sync.clicked.connect(
+                lambda checked=False, k=key: self.sync_requested.emit(k)
+            )
+            sync.setEnabled(False)
+            self.sync_buttons[key] = sync
+            self.step_buttons[key] = (minus, plus)
+            for button in (minus, sync, plus):
+                buttons.addWidget(button)
+            group.addLayout(buttons)
+            row.addLayout(group)
+        self.fd_button = QPushButton("F/D")
+        self.fd_button.setCheckable(True)
+        self.fd_button.clicked.connect(lambda checked=False: self.fd_toggle_requested.emit())
+        row.addWidget(self.fd_button)
+        row.addStretch()
+
+    def set_targets(self, targets):
+        self.value_labels["speed_kt"].setText(f'{targets["speed_kt"]:.0f}')
+        self.value_labels["heading_deg"].setText(f'{int(round(targets["heading_deg"])) % 360:03d}')
+        self.value_labels["altitude_ft"].setText(f'{int(round(targets["altitude_ft"])):05d}')
+        self.fd_button.setChecked(bool(targets["fd_enabled"]))
+
+    def set_sync_available(self, key, available):
+        self.sync_buttons[key].setEnabled(available)
+
 # ==================== GENERIC TAPE (SPEED / ALTITUDE) ====================
 class TapeWidget(QWidget):
+    HEADER_HEIGHT = 28
+
     def __init__(self, label: str, fmt: str, color=QColor(255, 255, 255), parent=None):
         super().__init__(parent)
-
-        # --- Display configuration ---
-        self.label = label      # Display label ("TAS", "ALT", etc.)
-        self.value = 0.0        # Current numeric value (e.g., knots, feet)
-        self.fmt = fmt          # Format string for numeric display (e.g. "{:.0f}") ?????
-        self.color = color      # Accent color for tick marks and text
-
-        # Minimum visible size (prevents layout from collapsing)
+        self.label = label
+        self.value = 0.0
+        self.selected_value = None
+        self.fmt = fmt
+        self.color = color
         self.setMinimumSize(70, 280)
 
-    def set_value(self, v: float):
-        self.value = float(v)
-        self.update()  # Triggers paintEvent()
+    def set_value(self, value):
+        self.value = float(value)
+        self.update()
 
-    # Paint routine (responsible for all drawing)
-    def paintEvent(self, e):
+    def set_selected_value(self, value):
+        value = float(value)
+        if not math.isfinite(value):
+            return
+        self.selected_value = value
+        self.update()
+
+    def paintEvent(self, event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)  # Smooth edges
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        magenta = QColor(255, 0, 255)
+        is_speed = self.label == "TAS"
 
-        R = self.rect()
-        clipping_box = QRectF(R.left(), R.top()+5, R.width(), R.height()-11)
-         # Apply clipping region so numbers arent drawn outside of box
-        p.setClipRect(clipping_box)
+        # Selected value sits above the scrolling tape.
+        p.setPen(magenta)
+        p.setFont(QFont("Consolas", 13, QFont.Weight.Bold))
+        selected_text = "---"
+        if self.selected_value is not None:
+            selected_text = (f"{self.selected_value:.0f}" if is_speed else
+                             f"{int(round(self.selected_value)):05d}")
+        p.drawText(QRectF(0, 0, self.width(), self.HEADER_HEIGHT),
+                   Qt.AlignmentFlag.AlignCenter, selected_text)
 
-        # Inset drawing area (6 px padding on each side)
-        R = self.rect().adjusted(6, 6, -6, -6)
-
-        # Draw a dark gray background with a thin white border
-        p.fillRect(R, QColor(0, 0, 0, 100))               # background fill
-        p.setPen(QPen(Qt.GlobalColor.white, 1))         # border outline
-        p.drawRect(R)
-
-        cy = R.center().y()                             # vertical center (origin for tick offsets)
-
-        # --- Style for tick marks and text ---
-        p.setPen(QPen(Qt.GlobalColor.white, 2))
-        p.setFont(QFont("Consolas", 13))
-
-        # --- Tick marks and labels ---
-        if self.label =="TAS":                          # Speed tape
-            ticks = range(0, 201, 10)
-            scale = 4
-        else:                                           # Altitude tape
-            ticks = range(0 , 5000, 100)                # this is the maximum and minimum numbers displayed, so 
-            scale = 0.4                                 # right now, altitude wont show above 5000
-            
-        # Draw ticks every x units in a range
-        p.setPen(QPen(Qt.GlobalColor.white, 2))
-        for tickvalue in ticks:
-            y = cy + (self.value - tickvalue) * scale - 2           # vertical position per tick
-            if self.label == "TAS":                                 # Speed tape
-                p.drawLine(QPointF(R.right() - 2, y), QPointF(R.right() - 18, y))  # tick line
-                p.drawText(
-                    QRectF(R.right() - 55, y - 8, 35, 16),
-                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                    f"{abs(tickvalue)}"                             # number label
-                )
-            else:                                                    # Altitude tape
-                p.drawLine(QPointF(R.left() + 2, y), QPointF(R.left() + 18, y))  # tick line
-                p.drawText(
-                    QRectF(R.left() + 20, y - 8, 45, 16),
-                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                    f"{abs(tickvalue)}"                             # number label
-                )
-
-        # Important number box (polygon with exact number for altitude/airspeed)
-        p.setBrush(Qt.GlobalColor.black)
-
-        if self.label == "TAS":  # Pointing right
-            importantnumberpoints = [QPointF(R.right() - 6, cy), QPointF(R.right() - 12, cy + 6), QPointF(R.right() - 12, cy + 14), QPointF(R.left(), cy + 14), QPointF(R.left(), cy - 14), QPointF(R.right() - 12, cy - 14), QPointF(QPointF(R.right() - 12, cy - 6))]
-        else:                    # Pointing left
-            importantnumberpoints = [QPointF(R.left() + 6, cy), QPointF(R.left() + 12, cy + 6), QPointF(R.left() + 12, cy + 14), QPointF(R.right(), cy + 14), QPointF(R.right(), cy - 14), QPointF(R.left() + 12, cy - 14), QPointF(QPointF(R.left() + 12, cy - 6))]
-
-        # Draw and fill the polygon
-        tapepoly = QPolygonF(importantnumberpoints)
-        p.drawPolygon(tapepoly)
-
-        text_rect = tapepoly.boundingRect()
-        p.setPen(Qt.GlobalColor.white)
-        p.setFont(QFont("Consolas", 15, QFont.Weight.Bold))
-
-        if math.isnan(self.value): # nan protection (not sure if still needed)
-            display_value = 0
-        else:
-            display_value = int(self.value)
-
-        p.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, f"{display_value}")    # exact value of altitude/airspeed
-
-    # Bottom Box (label TAS or ALT)
-        # Subtract 20 from the bottom so it sits inside the frame
-        box_y = R.bottom() - 20 
-
-        # Draw the Box
-        p.setBrush(QColor("black"))
+        R = QRectF(self.rect()).adjusted(6, self.HEADER_HEIGHT + 6, -6, -6)
+        cy = R.center().y()
+        p.fillRect(R, QColor(0, 0, 0, 100))
         p.setPen(QPen(Qt.GlobalColor.white, 1))
-        p.drawRect(R.left(), box_y, R.width(), 20)
+        p.drawRect(R)
+        p.save()
+        p.setClipRect(R)
 
-        # Draw the Text centered in that new box
+        value_valid = math.isfinite(self.value)
+        value = self.value if value_valid else 0.0
+        spacing, scale = (10, 4.0) if is_speed else (100, 0.4)
+        half_span = R.height() / (2 * scale)
+        first = math.floor((value - half_span) / spacing) * spacing
+        last = math.ceil((value + half_span) / spacing) * spacing
+        if is_speed:
+            first = max(0, first)
+        p.setPen(QPen(Qt.GlobalColor.white, 2))
+        p.setFont(QFont("Consolas", 12))
+        for tick in range(int(first), int(last) + spacing, spacing):
+            y = cy + (value - tick) * scale
+            if is_speed:
+                p.drawLine(QPointF(R.right() - 2, y), QPointF(R.right() - 18, y))
+                text = QRectF(R.left() + 2, y - 9, R.width() - 24, 18)
+                alignment = Qt.AlignmentFlag.AlignRight
+            else:
+                p.drawLine(QPointF(R.left() + 2, y), QPointF(R.left() + 18, y))
+                text = QRectF(R.left() + 20, y - 9, R.width() - 22, 18)
+                alignment = Qt.AlignmentFlag.AlignLeft
+            p.drawText(text, alignment | Qt.AlignmentFlag.AlignVCenter, str(tick))
+
+        # Current value retains the white pointer box.
+        if is_speed:
+            points = [(R.right()-6, cy), (R.right()-12, cy+6),
+                      (R.right()-12, cy+14), (R.left(), cy+14),
+                      (R.left(), cy-14), (R.right()-12, cy-14),
+                      (R.right()-12, cy-6)]
+        else:
+            points = [(R.left()+6, cy), (R.left()+12, cy+6),
+                      (R.left()+12, cy+14), (R.right(), cy+14),
+                      (R.right(), cy-14), (R.left()+12, cy-14),
+                      (R.left()+12, cy-6)]
+        pointer = QPolygonF([QPointF(x, y) for x, y in points])
+        p.setBrush(Qt.GlobalColor.black)
+        p.setPen(QPen(Qt.GlobalColor.white, 1))
+        p.drawPolygon(pointer)
+        p.setFont(QFont("Consolas", 14, QFont.Weight.Bold))
+        current_text = self.fmt.format(value) if value_valid else "--"
+        p.drawText(pointer.boundingRect(), Qt.AlignmentFlag.AlignCenter, current_text)
+
+        label_rect = QRectF(R.left(), R.bottom() - 20, R.width(), 20)
+        p.fillRect(label_rect, Qt.GlobalColor.black)
         p.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
-        label_text = "TAS" if self.label == "TAS" else "ALT"
+        p.drawRect(label_rect)
+        p.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, self.label)
 
-        p.drawText(R.left(), box_y, R.width(), 20, 
-                Qt.AlignmentFlag.AlignCenter, label_text)
+        # ACRON: Mark selected speed or altitude on the tape; point to off-scale targets.
+        if self.selected_value is not None and value_valid:
+            raw_y = cy + (value - self.selected_value) * scale
+            top, bottom = R.top() + 10, label_rect.top() - 10
+            y = max(top, min(bottom, raw_y))
+            x = R.right() - 8 if is_speed else R.left() + 8
+            if raw_y < top or raw_y > bottom:
+                base_y = y + 8 if raw_y < top else y - 8
+                points = [(x, y), (x-6, base_y), (x+6, base_y)]
+            elif is_speed:
+                points = [(R.right()-1, y), (R.right()-12, y-7), (R.right()-12, y+7)]
+            else:
+                points = [(R.left()+1, y), (R.left()+12, y-7), (R.left()+12, y+7)]
+            p.setPen(QPen(magenta, 2))
+            p.setBrush(magenta)
+            p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in points]))
+        p.restore()
 
 
 # ====================== VERTICAL RATE =========================
@@ -356,17 +587,24 @@ class CompassWidget(QWidget):
     def __init__(self, parent = None):
         super().__init__(parent)
         self.heading = 0.0
-        self.setMinimumSize(230, 230)
+        self.selected_heading = None
+        self.setMinimumSize(180, 180)
 
     def set_heading(self, deg: float):
         self.heading = float(deg) % 360.0
         self.update()
 
+    def set_selected_heading(self, deg):
+        deg = float(deg)
+        if math.isfinite(deg):
+            self.selected_heading = deg % 360.0
+            self.update()
+
     def paintEvent(self, e):
         # Draw compass circle and labels
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        R = self.rect().adjusted(8, 8, -8, -8)
+        R = self.rect().adjusted(8, 8, -8, -36)
         cx, cy = R.center().x(), R.center().y()
         r = min(R.width(), R.height()) * 0.42
 
@@ -424,6 +662,25 @@ class CompassWidget(QWidget):
             Qt.AlignmentFlag.AlignCenter,
             f"{display_heading}"
         )
+
+        # ACRON: Draw the selected heading relative to the current compass heading.
+        if self.selected_heading is not None and math.isfinite(self.heading):
+            angle = self.selected_heading - self.heading
+            def ring_point(deg, radius):
+                a = math.radians(deg)
+                return QPointF(cx + math.sin(a) * radius,
+                               cy - math.cos(a) * radius)
+            p.setPen(QPen(QColor(255, 0, 255), 2))
+            p.setBrush(QColor(255, 0, 255))
+            p.drawPolygon(QPolygonF([
+                ring_point(angle, r * 0.80),
+                ring_point(angle - 6, r * 1.04),
+                ring_point(angle + 6, r * 1.04)
+            ]))
+            p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+            selected = int(round(self.selected_heading)) % 360
+            p.drawText(QRectF(0, self.height() - 27, self.width(), 24),
+                       Qt.AlignmentFlag.AlignCenter, f"HDG {selected:03d}")
 
 
 class VMap(QWidget): # This is unused and broken right now, supposed to be a vertial situation indicator

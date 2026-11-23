@@ -1,5 +1,9 @@
 from __future__ import annotations
+from simcore.shared_state import (
+    mcp_targets, mcp_targets_lock, adjust_mcp_target, set_mcp_target, toggle_mcp_fd
+)
 import sys
+import math
 import json
 import os
 from PyQt6.QtCore import Qt, QPointF, QRectF, QObject, pyqtProperty, pyqtSignal, QUrl
@@ -30,6 +34,7 @@ def start_tile_server():    # this is for the map
 class CockpitWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.last_flight_state = {}
         self.resize(1280, 720)
 
         # --- WINDOW SETUP ---
@@ -81,10 +86,11 @@ class CockpitWindow(QMainWindow):
             self.ai.setGeometry(0, 0, w, h)
             
             # Top Layer (Tapes & Gauges) (x,y,width,height)
-            self.tas.setGeometry(20, int(h * 0.25), 90, int(h * 0.5))
-            self.alt.setGeometry(int(w - 120), int(h * 0.25), 90, int(h * 0.5))
+            header = TapeWidget.HEADER_HEIGHT
+            self.tas.setGeometry(20, int(h * 0.25) - header, 90, int(h * 0.5) + header)
+            self.alt.setGeometry(int(w - 120), int(h * 0.25) - header, 90, int(h * 0.5) + header)
             self.vrate.setGeometry(int(w - 30-6), int(h * 0.25) + int(h * 0.15/2), 30+6, int(h * 0.35))
-            self.compass.setGeometry(int(w / 2 - 110), int(h * 0.7), 120, 120)
+            self.compass.setGeometry(int(w / 2 - 90), max(0, h - 190), 180, 180)
 
             # FORCE Z-ORDER
             self.terrain_view.lower()
@@ -100,6 +106,10 @@ class CockpitWindow(QMainWindow):
         from PyQt6.QtGui import QShortcut, QKeySequence
         self.t_key = QShortcut(QKeySequence("T"), self)
         self.t_key.activated.connect(self.toggle_ai_bg)
+        # F toggles the flight director
+        self.fd_key = QShortcut(QKeySequence("F"), self)
+        self.fd_key.setAutoRepeat(False)
+        self.fd_key.activated.connect(self.toggle_flight_director)
 
         # =========================================================
         # RIGHT PANEL
@@ -154,17 +164,30 @@ class CockpitWindow(QMainWindow):
         grid = QGridLayout(central)
         grid.setContentsMargins(6, 6, 6, 6)
         grid.setHorizontalSpacing(10)
-        grid.addWidget(left, 0, 0)
-        grid.addWidget(right, 0, 1)
+        self.mcp = ModeControlPanel()
+        self.mcp.target_step_requested.connect(self.change_selected_target)
+        self.mcp.sync_requested.connect(self.sync_selected_target)
+        self.mcp.fd_toggle_requested.connect(self.toggle_flight_director)
+        grid.addWidget(self.mcp, 0, 0, 1, 2)
+        grid.addWidget(left, 1, 0)
+        grid.addWidget(right, 1, 1)
+        grid.setRowStretch(1, 1)
         grid.setColumnStretch(0, 2)
         grid.setColumnStretch(1, 2)
 
         self.setCentralWidget(central)
+        self.refresh_selected_targets()
         self.ui_loop = UIUpdateLoop(self)
 
     # Get state from JSBsim and set value of widget variables
     def handleUpdate(self, d: dict):
+        self.last_flight_state = d.copy()
         self.ai.set_state(d["roll_deg"], d["pitch_deg"])
+        # ACRON: Pass live velocity to the FPV and live altitude and heading to the F/D.
+        self.ai.set_velocity(d["u_fps"], d["v_fps"], d["w_fps"])
+        self.ai.overlay.set_altitude(d["alt_ft"])
+        self.ai.overlay.set_heading(d["hdg_deg"])
+        self.refresh_selected_targets()
         self.tas.set_value(d["tas_kt"])
         self.alt.set_value(d["alt_ft"])
         self.compass.set_heading(d["hdg_deg"])
@@ -183,6 +206,41 @@ class CockpitWindow(QMainWindow):
         self.battery.set_value(d["hdg_deg"] / 3.6)
         self.range.set_value(d["range_nm"])
         self.endurance.set_value(d["endurance_min"])
+
+    def refresh_selected_targets(self):
+        # ACRON: Refresh the panel, instrument bugs, and F/D from one set of targets.
+        with mcp_targets_lock:
+            targets = mcp_targets.copy()
+        self.tas.set_selected_value(targets["speed_kt"])
+        self.alt.set_selected_value(targets["altitude_ft"])
+        self.compass.set_selected_heading(targets["heading_deg"])
+        self.map.set_selected_heading(targets["heading_deg"])
+        self.ai.overlay.set_selected_targets(targets["heading_deg"], targets["altitude_ft"])
+        self.ai.overlay.fd_enabled = targets["fd_enabled"]
+        self.ai.overlay.update()
+        self.mcp.set_targets(targets)
+        for key, field in [("speed_kt", "tas_kt"),
+                           ("heading_deg", "hdg_deg"),
+                           ("altitude_ft", "alt_ft")]:
+            current = self.last_flight_state.get(field)
+            self.mcp.set_sync_available(
+                key, current is not None and math.isfinite(current)
+            )
+
+    def change_selected_target(self, key, clicks):
+        adjust_mcp_target(key, clicks)
+        self.refresh_selected_targets()
+
+    def sync_selected_target(self, key):
+        fields = {"speed_kt": "tas_kt", "heading_deg": "hdg_deg", "altitude_ft": "alt_ft"}
+        current = self.last_flight_state.get(fields[key])
+        if current is not None and math.isfinite(current):
+            set_mcp_target(key, current)
+            self.refresh_selected_targets()
+
+    def toggle_flight_director(self):
+        toggle_mcp_fd()
+        self.refresh_selected_targets()
 
     def toggle_ai_bg(self): # T to toggle terrain 
         if hasattr(self, 'ai'):
